@@ -120,11 +120,6 @@ RUN --mount=type=bind,source=./sub-packages/bionemo-geometric/requirements.txt,t
 ENV WORKDIR=/workspace/bionemo2
 WORKDIR ${WORKDIR}
 
-# Install 3rd-party deps and bionemo submodules.
-COPY ./LICENSE /workspace/bionemo2/LICENSE
-COPY ./3rdparty /workspace/bionemo2/3rdparty
-COPY ./sub-packages /workspace/bionemo2/sub-packages
-
 COPY --from=rust-env /usr/local/cargo /usr/local/cargo
 COPY --from=rust-env /usr/local/rustup /usr/local/rustup
 
@@ -196,10 +191,26 @@ WORKDIR /workspace/bionemo2
 RUN uv pip install maturin --no-build-isolation --break-system-packages
 RUN pip install --use-deprecated=legacy-resolver  --no-build-isolation tensorstore==0.1.45
 
+RUN git clone https://github.com/NVIDIA/nvidia-resiliency-ext && \
+    cd nvidia-resiliency-ext && \
+    uv pip install .
+
+# Install 3rd-party deps and bionemo submodules.
+COPY ./LICENSE /workspace/bionemo2/LICENSE
+COPY ./3rdparty /workspace/bionemo2/3rdparty
+COPY ./sub-packages /workspace/bionemo2/sub-packages
+
 RUN --mount=type=bind,source=./requirements-test.txt,target=/requirements-test.txt \
   --mount=type=bind,source=./requirements-cve.txt,target=/requirements-cve.txt \
 # Comment out mamba install in NeMo as this causes issues.
   sed -i "/mamba-ssm/d" ./3rdparty/NeMo/requirements/requirements_nlp.txt && \
+  # Install core dependencies first with specific versions
+  pip install --no-deps fsspec==2023.5.0 && \
+  pip install --no-deps s3fs==2023.12.2 && \
+  pip install --no-deps aiobotocore==2.5.4 && \
+  pip install --no-deps botocore==1.31.17 && \
+  pip install --no-deps psutil==5.9.8 && \
+  # Now install the rest of the packages
   uv pip install --no-build-isolation \
   ./3rdparty/* \
   ./sub-packages/bionemo-* \

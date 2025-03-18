@@ -1,5 +1,5 @@
 # Base image with apex and transformer engine, but without NeMo or Megatron-LM.
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.01-py3
 
 FROM rust:1.82.0 as rust-env
 
@@ -204,6 +204,7 @@ RUN --mount=type=bind,source=./requirements-test.txt,target=/requirements-test.t
   --mount=type=bind,source=./requirements-cve.txt,target=/requirements-cve.txt \
 # Comment out mamba install in NeMo as this causes issues.
   sed -i "/mamba-ssm/d" ./3rdparty/NeMo/requirements/requirements_nlp.txt && \
+  sed -i "/ngcsdk/d" ./sub-packages/bionemo-core/pyproject.toml && \
   # Now install the rest of the packages
   uv pip install --no-build-isolation \
   ./3rdparty/* \
@@ -211,6 +212,8 @@ RUN --mount=type=bind,source=./requirements-test.txt,target=/requirements-test.t
   -r /requirements-cve.txt \
   -r /requirements-test.txt && rm -rf ./3rdparty && rm -rf /tmp/* && rm -rf ./sub-packages/bionemo-noodles/target \
   && rm -rf /root/.cache/*
+
+RUN uv pip install ngcsdk
 
 # In the devcontainer image, we just copy over the finished `dist-packages` folder from the build image back into the
 # base pytorch container. We can then set up a non-root user and uninstall the bionemo and 3rd-party packages, so that
@@ -316,6 +319,7 @@ EOF
 # to circumvent python import issues
 RUN sed -i '42i\        # Bionemo hack to fix ARM issues with faiss\n        return False' /usr/local/lib/python3.12/dist-packages/faiss/loader.py
 
+
 # Since the entire repo is owned by root, swithcing username for development breaks things.
 ARG USERNAME=bionemo
 RUN chown $USERNAME:$USERNAME -R /workspace/bionemo2/
@@ -326,6 +330,10 @@ USER $USERNAME
 # This would reduce the overall image size by reducing the number of intermediate layers. In the meantime, we match the
 # existing release image build by copying over remaining files from the repo into the container.
 FROM bionemo2-base AS release
+
+# Install AWS CLI v2:
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && ./aws/install
 
 RUN mkdir -p /workspace/bionemo2/.cache/
 

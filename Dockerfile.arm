@@ -204,12 +204,6 @@ RUN --mount=type=bind,source=./requirements-test.txt,target=/requirements-test.t
   --mount=type=bind,source=./requirements-cve.txt,target=/requirements-cve.txt \
 # Comment out mamba install in NeMo as this causes issues.
   sed -i "/mamba-ssm/d" ./3rdparty/NeMo/requirements/requirements_nlp.txt && \
-  # Install core dependencies first with specific versions
-  pip install --no-deps fsspec==2023.5.0 && \
-  pip install --no-deps s3fs==2023.12.2 && \
-  pip install --no-deps aiobotocore==2.5.4 && \
-  pip install --no-deps botocore==1.31.17 && \
-  pip install --no-deps psutil==5.9.8 && \
   # Now install the rest of the packages
   uv pip install --no-build-isolation \
   ./3rdparty/* \

@@ -46,12 +46,14 @@ from nemo.lightning.pytorch.optim.megatron import MegatronOptimizerModule
 from nemo.lightning.pytorch.strategies.utils import RestoreConfig
 from nemo.utils.exp_manager import TimingCallback
 
+# Add import for Mamba models
+from bionemo.evo2.models.mamba import MAMBA_MODEL_OPTIONS, MambaModel
 from bionemo.llm.utils.datamodule_utils import infer_global_batch_size
 from bionemo.llm.utils.logger_utils import WandbConfig, setup_nemo_lightning_logger
 
 # TODO(dorotat_nv) remove when https://github.com/NVIDIA/bionemo-framework/issues/749
 from bionemo.testing.testing_callbacks import SignalAfterGivenStepCallback
-
+from eden_dataset import FastaDataModule
 
 torch._dynamo.config.suppress_errors = True
 
@@ -74,6 +76,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--mock-data",
         action="store_true",
         help="Train with Mock data (for testing/debugging), either set this or provide a dataset config.",
+    )
+    data_group.add_argument(
+        "--fasta-data",
+        action="store_true",
+        help="Train with Fasta data, either set this or provide a dataset config.",
     )
 
     parser.add_argument(
@@ -164,13 +171,18 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--align-param-gather", action="store_true", default=False)
     # parser.add_argument("--straggler-detection", action="store_true", default=False)
     parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["hyena", "mamba"],
+        default="hyena",
+        help="Model architecture family to use. Choose between 'hyena' and 'mamba'.",
+    )
+    parser.add_argument(
         "--model-size",
         type=str,
-        choices=sorted(HYENA_MODEL_OPTIONS.keys()),
+        choices=sorted(list(HYENA_MODEL_OPTIONS.keys()) + list(MAMBA_MODEL_OPTIONS.keys())),
         default="7b",
-        help="Model architecture to use, choose between 7b, 40b, or test (a sub-model of 4 layers, less than 1B "
-        "parameters). '_arc_1m' models have GLU / FFN dimensions that support 1M context length when trained "
-        "with TP<=8.",
+        help="Model size/configuration to use. Options depend on the selected model-type.",
     )
     parser.add_argument(
         "--add-bias-output",
@@ -203,6 +215,24 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Directory to restore an initial checkpoint from. Use this for supervised fine-tuning.",
     )
     parser.add_argument("--wd", type=float, default=0.01, help="Weight decay for optimizer.")
+    parser.add_argument(
+        "--adam-beta1",
+        type=float,
+        default=0.9,
+        help="Adam optimizer beta1 parameter.",
+    )
+    parser.add_argument(
+        "--adam-beta2",
+        type=float,
+        default=0.95,
+        help="Adam optimizer beta2 parameter.",
+    )
+    parser.add_argument(
+        "--adam-eps",
+        type=float,
+        default=1e-8,
+        help="Adam optimizer epsilon parameter. The inverse of this value (1/eps) represents the maximum adaptive learning rate per parameter.",
+    )
     parser.add_argument(
         "--restore-optimizer-from-ckpt",
         action="store_true",
@@ -411,6 +441,16 @@ def train(args: argparse.Namespace) -> nl.Trainer:
             num_workers=args.workers,
             tokenizer=tokenizer,
         )
+
+    elif args.fasta_data:
+        data = FastaDataModule(
+            fasta_file="/workspace/bionemo2/bionemo-evo2/bcr_small_ctrl_tags.fasta",
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            global_batch_size=global_batch_size,
+            num_workers=args.workers,
+            tokenizer=tokenizer,
+        )
     else:
         blended_dataset_config = parse_dataset_config(
             dataset_config_path=args.dataset_config, dataset_path=args.dataset_dir
@@ -467,12 +507,20 @@ def train(args: argparse.Namespace) -> nl.Trainer:
     if args.num_layers:
         config_modifiers_init["num_layers"] = args.num_layers
 
-    if args.model_size not in HYENA_MODEL_OPTIONS:
-        raise ValueError(f"Invalid model size: {args.model_size}")
-    evo2_config = HYENA_MODEL_OPTIONS[args.model_size](**config_modifiers_init)
-
-    # Instantiate model.
-    model = llm.HyenaModel(evo2_config, tokenizer=data_module.tokenizer)
+    # Create model based on selected model type
+    if args.model_type == "hyena":
+        if args.model_size not in HYENA_MODEL_OPTIONS:
+            raise ValueError(f"Invalid model size for Hyena: {args.model_size}")
+        model_config = HYENA_MODEL_OPTIONS[args.model_size](**config_modifiers_init)
+        model = llm.HyenaModel(model_config, tokenizer=data.tokenizer)
+    else:  # mamba
+        if args.model_size not in MAMBA_MODEL_OPTIONS:
+            raise ValueError(f"Invalid model size for Mamba: {args.model_size}")
+        add_bias_output = config_modifiers_init.pop("add_bias_output")
+        if add_bias_output:
+            raise ValueError("Bias output is not supported for Mamba models.")
+        model_config = MAMBA_MODEL_OPTIONS[args.model_size](**config_modifiers_init)
+        model = MambaModel(model_config, tokenizer=data.tokenizer)
 
     # Setup callbacks.
     callbacks = [
@@ -497,8 +545,8 @@ def train(args: argparse.Namespace) -> nl.Trainer:
     if args.create_tflops_callback:
         # Add callback that logs the tera-FLOPS per second per GPU during training.
         flop_meas_callback = FLOPsMeasurementCallback(
-            evo2_config,
-            data_module,
+            model_config,
+            data,
             "hyena",
         )
         callbacks.append(flop_meas_callback)
@@ -525,7 +573,7 @@ def train(args: argparse.Namespace) -> nl.Trainer:
             tp_comm_overlap_cfg = userbuffers_bf16_h100_h8192_tp4_mbs1_seqlen8192
         callbacks.append(
             MegatronCommOverlapCallback(
-                tp_comm_overlap=evo2_config.tp_comm_overlap,
+                tp_comm_overlap=model_config.tp_comm_overlap,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
                 tp_comm_bootstrap_backend=args.tp_comm_overlap_backend,
                 wgrad_deferral_limit=22,  # default from NeMo
@@ -551,36 +599,31 @@ def train(args: argparse.Namespace) -> nl.Trainer:
             )
         )
 
-    wandb_run_name = (
-        f"evo2-size-{args.model_size}-TP{args.tensor_parallel_size}-"
-        f"PP{args.pipeline_model_parallel_size}-CP{args.context_parallel_size}"
-        f"-GBS{global_batch_size}-MBS{args.micro_batch_size}-SkipLossRenorm{args.no_renormalize_loss}"
-        f"-NOAC{args.no_activation_checkpointing}-SELAC{args.selective_activation_checkpointing}"
-        f"-ACRNL{evo2_config.recompute_num_layers}"
-        f"-PAT{evo2_config.hybrid_override_pattern}"
-        f"-F32R{evo2_config.fp32_residual_connection}"
-        f"-FCE{evo2_config.cross_entropy_loss_fusion}"
-        f"-AIC{not args.no_average_in_collective}"
-        f"-PEOD{args.eod_pad_in_loss_mask}"
-        f"-BO{args.add_bias_output}"
-        f"-GCLP{args.clip_grad}"
-        f"-HDO{args.hidden_dropout}"
-        f"-ADO{args.attention_dropout}"
-        f"-LR{args.lr}-MINLR{args.min_lr}-WUSTEPS{args.warmup_steps}-WD{args.wd}"
-        f"-GRFP32{args.grad_reduce_in_fp32}-FP8WG{args.fp8_wgrad and args.fp8}"
-        f"-OGR{args.overlap_grad_reduce}-OPG{args.overlap_param_gather}"
-        f"-NODES{args.num_nodes}-FP8{args.fp8}"
-    )
-
-    wandb_config: Optional[WandbConfig] = (
-        None
-        if args.wandb_project is None
-        else WandbConfig(
-            offline=args.wandb_offline,
-            project=args.wandb_project,
-            name=wandb_run_name,
-            entity=args.wandb_entity,
-            tags=args.wandb_tags,
+    loggers = []
+    nemo_logger_kwargs = {}
+    if (not args.no_wandb) and args.wandb_project:
+        wandb_logger = WandbLogger(
+            name=(
+                f"evo2-size-{args.model_size}-TP{args.tensor_parallel_size}-"
+                f"PP{args.pipeline_model_parallel_size}-CP{args.context_parallel_size}"
+                f"-GBS{global_batch_size}-MBS{args.micro_batch_size}-SkipLossRenorm{args.no_renormalize_loss}"
+                f"-NOAC{args.no_activation_checkpointing}-SELAC{args.selective_activation_checkpointing}"
+                f"-ACRNL{model_config.recompute_num_layers}"
+                f"-PAT{model_config.hybrid_override_pattern}"
+                f"-F32R{model_config.fp32_residual_connection}"
+                f"-FCE{model_config.cross_entropy_loss_fusion}"
+                f"-AIC{not args.no_average_in_collective}"
+                f"-PEOD{args.eod_pad_in_loss_mask}"
+                f"-BO{args.add_bias_output}"
+                f"-GCLP{args.clip_grad}"
+                f"-HDO{args.hidden_dropout}"
+                f"-ADO{args.attention_dropout}"
+                f"-LR{args.lr}-MINLR{args.min_lr}-WUSTEPS{args.warmup_steps}-WD{args.wd}"
+                f"-B1{args.adam_beta1}-B2{args.adam_beta2}-EPS{args.adam_eps}"
+                f"-GRFP32{args.grad_reduce_in_fp32}-FP8WG{args.fp8_wgrad and args.fp8}"
+                f"-OGR{args.overlap_grad_reduce}-OPG{args.overlap_param_gather}"
+                f"-NODES{args.num_nodes}-FP8{args.fp8}"
+            ),
             group=args.wandb_group,
             job_type=args.wandb_job_type,
             id=args.wandb_id,
@@ -687,10 +730,11 @@ def train(args: argparse.Namespace) -> nl.Trainer:
     opt_config = OptimizerConfig(
         optimizer="adam",
         lr=args.lr,
-        adam_beta1=0.9,
-        adam_beta2=0.95,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
         weight_decay=args.wd,
         clip_grad=args.clip_grad,
+        adam_eps=args.adam_eps,
         use_distributed_optimizer=True,
         bf16=True,
     )
@@ -701,7 +745,7 @@ def train(args: argparse.Namespace) -> nl.Trainer:
         min_lr=args.min_lr,
     )
 
-    opt = MegatronOptimizerModule(opt_config, sched, no_weight_decay_cond=evo2_config.hyena_no_weight_decay_cond_fn)
+    opt = MegatronOptimizerModule(opt_config, sched, no_weight_decay_cond=model_config.hyena_no_weight_decay_cond_fn)
     opt.connect(model)
 
     # Start training
